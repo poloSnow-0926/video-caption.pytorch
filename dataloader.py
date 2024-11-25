@@ -1,87 +1,121 @@
-import json
-
-import random
-import os
-import numpy as np
+import pandas as pd
+import ast
 import torch
 from torch.utils.data import Dataset
+import numpy as np
+import os
+import re
+import random
 
-
-class VideoDataset(Dataset):
-
+class CustomVideoDataset(Dataset):
+    def __init__(self, opt, mode='train'):
+        super(CustomVideoDataset, self).__init__()
+        self.mode = mode
+        self.max_len = opt["max_len"]
+        
+        # 读取CSV数据
+        self.df = pd.read_csv(opt["caption_csv"])
+        # 转换captions从字符串到列表
+        self.df['captions'] = self.df['captions'].apply(ast.literal_eval)
+        
+        # 构建词汇表
+        self.build_vocab()
+        
+        # 特征目录
+        self.feats_dir = opt["feats_dir"]
+        self.with_c3d = opt.get('with_c3d', 0)
+        self.c3d_feats_dir = opt.get('c3d_feats_dir', '')
+        
+        # 获取视频文件列表并建立映射
+        self.video_files = self.get_video_files()
+        
+    def build_vocab(self):
+        # 构建词汇表
+        word_counts = {}
+        for captions in self.df['captions']:
+            for caption in captions:
+                for word in caption.split():
+                    word_counts[word] = word_counts.get(word, 0) + 1
+        
+        # 添加特殊标记
+        self.word_to_ix = {'<pad>': 0, '<sos>': 1, '<eos>': 2, '<unk>': 3}
+        for word in word_counts:
+            if word not in self.word_to_ix:
+                self.word_to_ix[word] = len(self.word_to_ix)
+        
+        self.ix_to_word = {v: k for k, v in self.word_to_ix.items()}
+        
+    def get_video_files(self):
+        # 获取特征文件列表并建立与video_id的映射
+        video_mapping = {}
+        for filename in os.listdir(self.feats_dir):
+            if filename.endswith('.npy'):
+                # 使用正则表达式提取video_id
+                match = re.match(r"(G_\d+)", filename)
+                if match:
+                    video_id = match.group(1)
+                    video_mapping[video_id] = filename
+        return video_mapping
+    
     def get_vocab_size(self):
-        return len(self.get_vocab())
-
+        return len(self.word_to_ix)
+    
     def get_vocab(self):
         return self.ix_to_word
-
-    def get_seq_length(self):
-        return self.seq_length
-
-    def __init__(self, opt, mode):
-        super(VideoDataset, self).__init__()
-        self.mode = mode  # to load train/val/test data
-
-        # load the json file which contains information about the dataset
-        self.captions = json.load(open(opt["caption_json"]))
-        info = json.load(open(opt["info_json"]))
-        self.ix_to_word = info['ix_to_word']
-        self.word_to_ix = info['word_to_ix']
-        print('vocab size is ', len(self.ix_to_word))
-        self.splits = info['videos']
-        print('number of train videos: ', len(self.splits['train']))
-        print('number of val videos: ', len(self.splits['val']))
-        print('number of test videos: ', len(self.splits['test']))
-
-        self.feats_dir = opt["feats_dir"]
-        self.c3d_feats_dir = opt['c3d_feats_dir']
-        self.with_c3d = opt['with_c3d']
-        print('load feats from %s' % (self.feats_dir))
-        # load in the sequence data
-        self.max_len = opt["max_len"]
-        print('max sequence length in data is', self.max_len)
-
-    def __getitem__(self, ix):
-        """This function returns a tuple that is further passed to collate_fn
-        """
-        # which part of data to load
-        if self.mode == 'val':
-            ix += len(self.splits['train'])
-        elif self.mode == 'test':
-            ix = ix + len(self.splits['train']) + len(self.splits['val'])
+    
+    def process_caption(self, caption):
+        # 将caption转换为词索引序列
+        words = caption.split()
+        if len(words) > self.max_len - 2:  # 留出<sos>和<eos>的位置
+            words = words[:(self.max_len - 2)]
         
-        fc_feat = []
-        for dir in self.feats_dir:
-            fc_feat.append(np.load(os.path.join(dir, 'video%i.npy' % (ix))))
-        fc_feat = np.concatenate(fc_feat, axis=1)
-        if self.with_c3d == 1:
-            c3d_feat = np.load(os.path.join(self.c3d_feats_dir, 'video%i.npy'%(ix)))
+        indices = [self.word_to_ix.get(word, self.word_to_ix['<unk>']) for word in words]
+        indices = [self.word_to_ix['<sos>']] + indices + [self.word_to_ix['<eos>']]
+        
+        return indices
+    
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        video_id = row['video_id']
+        captions = row['captions']
+        
+        # 加载特征
+        feat_path = os.path.join(self.feats_dir, self.video_files[video_id])
+        fc_feat = np.load(feat_path)
+        
+        # 处理C3D特征（如果需要）
+        if self.with_c3d:
+            c3d_feat = np.load(os.path.join(self.c3d_feats_dir, self.video_files[video_id]))
             c3d_feat = np.mean(c3d_feat, axis=0, keepdims=True)
             fc_feat = np.concatenate((fc_feat, np.tile(c3d_feat, (fc_feat.shape[0], 1))), axis=1)
-        label = np.zeros(self.max_len)
-        mask = np.zeros(self.max_len)
-        captions = self.captions['video%i'%(ix)]['final_captions']
-        gts = np.zeros((len(captions), self.max_len))
-        for i, cap in enumerate(captions):
-            if len(cap) > self.max_len:
-                cap = cap[:self.max_len]
-                cap[-1] = '<eos>'
-            for j, w in enumerate(cap):
-                gts[i, j] = self.word_to_ix[w]
-
-        # random select a caption for this video
-        cap_ix = random.randint(0, len(captions) - 1)
+        
+        # 处理所有caption
+        processed_captions = [self.process_caption(cap) for cap in captions]
+        
+        # 填充到相同长度
+        gts = np.zeros((len(processed_captions), self.max_len))
+        for i, cap in enumerate(processed_captions):
+            gts[i, :len(cap)] = cap
+        
+        # 随机选择一个caption
+        cap_ix = random.randint(0, len(processed_captions) - 1)
         label = gts[cap_ix]
+        
+        # 创建mask
+        mask = np.zeros(self.max_len)
         non_zero = (label == 0).nonzero()
         mask[:int(non_zero[0][0]) + 1] = 1
-
-        data = {}
-        data['fc_feats'] = torch.from_numpy(fc_feat).type(torch.FloatTensor)
-        data['labels'] = torch.from_numpy(label).type(torch.LongTensor)
-        data['masks'] = torch.from_numpy(mask).type(torch.FloatTensor)
-        data['gts'] = torch.from_numpy(gts).long()
-        data['video_ids'] = 'video%i'%(ix)
+        
+        # 返回数据字典
+        data = {
+            'fc_feats': torch.from_numpy(fc_feat).type(torch.FloatTensor),
+            'labels': torch.from_numpy(label).type(torch.LongTensor),
+            'masks': torch.from_numpy(mask).type(torch.FloatTensor),
+            'gts': torch.from_numpy(gts).long(),
+            'video_ids': video_id
+        }
+        
         return data
-
+    
     def __len__(self):
-        return len(self.splits[self.mode])
+        return len(self.df)

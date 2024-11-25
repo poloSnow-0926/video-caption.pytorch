@@ -1,107 +1,71 @@
-import shutil
-import subprocess
-import glob
-from tqdm import tqdm
-import numpy as np
-import os
-import argparse
-
 import torch
-from torch import nn
-import torch.nn.functional as F
-import pretrainedmodels
-from pretrainedmodels import utils
+import torch.nn as nn
+import torchvision.models as models
+import torchvision.transforms as transforms
+import cv2
+import pandas as pd
+import re
+import os
+import numpy as np
 
-C, H, W = 3, 224, 224
+def extract_video_features(video_path, model):
+    """提取视频特征"""
+    cap = cv2.VideoCapture(video_path)
+    frames = []
+    transform = transforms.Compose([
+        transforms.ToPILImage(),
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                           std=[0.229, 0.224, 0.225])
+    ])
+    
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frame = transform(frame).unsqueeze(0)
+        frames.append(frame)
+    
+    cap.release()
+    
+    # 将所有帧堆叠成一个批次
+    frames = torch.cat(frames, dim=0)
+    
+    # 提取特征
+    with torch.no_grad():
+        features = model(frames)
+    
+    # 返回平均特征
+    return features.mean(dim=0).numpy()
 
-
-def extract_frames(video, dst):
-    with open(os.devnull, "w") as ffmpeg_log:
-        if os.path.exists(dst):
-            print(" cleanup: " + dst + "/")
-            shutil.rmtree(dst)
-        os.makedirs(dst)
-        video_to_frames_command = ["ffmpeg",
-                                   # (optional) overwrite output file if it exists
-                                   '-y',
-                                   '-i', video,  # input file
-                                   '-vf', "scale=400:300",  # input file
-                                   '-qscale:v', "2",  # quality for JPEG
-                                   '{0}/%06d.jpg'.format(dst)]
-        subprocess.call(video_to_frames_command,
-                        stdout=ffmpeg_log, stderr=ffmpeg_log)
-
-
-def extract_feats(params, model, load_image_fn):
-    global C, H, W
+def process_videos(video_dir, output_dir, csv_path):
+    """处理所有视频并保存特征"""
+    # 加载预训练模型
+    model = models.resnet50(pretrained=True)
+    model = nn.Sequential(*list(model.children())[:-1])  # 移除最后的分类层
     model.eval()
-
-    dir_fc = params['output_dir']
-    if not os.path.isdir(dir_fc):
-        os.mkdir(dir_fc)
-    print("save video feats to %s" % (dir_fc))
-    video_list = glob.glob(os.path.join(params['video_path'], '*.mp4'))
-    for video in tqdm(video_list):
-        video_id = video.split("/")[-1].split(".")[0]
-        dst = params['model'] + '_' + video_id
-        extract_frames(video, dst)
-
-        image_list = sorted(glob.glob(os.path.join(dst, '*.jpg')))
-        samples = np.round(np.linspace(
-            0, len(image_list) - 1, params['n_frame_steps']))
-        image_list = [image_list[int(sample)] for sample in samples]
-        images = torch.zeros((len(image_list), C, H, W))
-        for iImg in range(len(image_list)):
-            img = load_image_fn(image_list[iImg])
-            images[iImg] = img
-        with torch.no_grad():
-            fc_feats = model(images.cuda()).squeeze()
-        img_feats = fc_feats.cpu().numpy()
-        # Save the inception features
-        outfile = os.path.join(dir_fc, video_id + '.npy')
-        np.save(outfile, img_feats)
-        # cleanup
-        shutil.rmtree(dst)
-
-
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--gpu", dest='gpu', type=str, default='0',
-                        help='Set CUDA_VISIBLE_DEVICES environment variable, optional')
-    parser.add_argument("--output_dir", dest='output_dir', type=str,
-                        default='data/feats/resnet152', help='directory to store features')
-    parser.add_argument("--n_frame_steps", dest='n_frame_steps', type=int, default=40,
-                        help='how many frames to sampler per video')
-
-    parser.add_argument("--video_path", dest='video_path', type=str,
-                        default='data/train-video', help='path to video dataset')
-    parser.add_argument("--model", dest="model", type=str, default='resnet152',
-                        help='the CNN model you want to use to extract_feats')
     
-    args = parser.parse_args()
-    os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
-    params = vars(args)
-    if params['model'] == 'inception_v3':
-        C, H, W = 3, 299, 299
-        model = pretrainedmodels.inceptionv3(pretrained='imagenet')
-        load_image_fn = utils.LoadTransformImage(model)
-
-    elif params['model'] == 'resnet152':
-        C, H, W = 3, 224, 224
-        model = pretrainedmodels.resnet152(pretrained='imagenet')
-        load_image_fn = utils.LoadTransformImage(model)
-
-    elif params['model'] == 'inception_v4':
-        C, H, W = 3, 299, 299
-        model = pretrainedmodels.inceptionv4(
-            num_classes=1000, pretrained='imagenet')
-        load_image_fn = utils.LoadTransformImage(model)
-
-    else:
-        print("doesn't support %s" % (params['model']))
-
-    model.last_linear = utils.Identity()
-    model = nn.DataParallel(model)
+    # 读取CSV文件
+    df = pd.read_csv(csv_path)
     
-    model = model.cuda()
-    extract_feats(params, model, load_image_fn)
+    # 创建特征字典
+    features_dict = {}
+    
+    # 获取视频文件列表
+    video_files = os.listdir(video_dir)
+    
+    for video_file in video_files:
+        # 使用正则表达式提取video_id
+        match = re.match(r"(G_\d+)", video_file)
+        if match:
+            video_id = match.group(1)
+            if video_id in df['video_id'].values:
+                video_path = os.path.join(video_dir, video_file)
+                features = extract_video_features(video_path, model)
+                features_dict[video_id] = features
+    
+    # 保存特征
+    np.save(os.path.join(output_dir, 'video_features.npy'), features_dict)
+    return features_dict
